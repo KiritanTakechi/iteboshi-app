@@ -28,8 +28,8 @@ serde_json = "1"
 
 uuid = { version = "1", features = ["v4", "serde"] }
 
-cpal = "0.15"             # 用于音频输入
-hound = "3.5"             # 用于写入 WAV 文件
-crossbeam-channel = "0.5" # 用于线程间通信
+tokio = { version = "1", features = ["full"] } # 使用 Tokio 运行时, 包含 mpsc 等
+rodio = "0.17"                                 # 音频播放和捕获库
+hound = "3.5"                                  # WAV 文件读写库
 
 [features]
