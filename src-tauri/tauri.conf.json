@@ -5,14 +5,14 @@
   "identifier": "com.touhouasia.iteboshi",
   "build": {
     "beforeDevCommand": "bun run dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "https://localhost:1420",
     "beforeBuildCommand": "bun run build",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
-        "title": "iteboshi",
+        "title": "Iteboshi",
         "width": 800,
         "height": 600
       }
