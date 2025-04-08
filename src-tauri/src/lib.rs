@@ -1,114 +1,84 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
-
+use crossbeam_channel::{Receiver, Sender, bounded};
+use hound::{SampleFormat, WavSpec, WavWriter};
 use parking_lot::Mutex;
+use rodio::{
+    cpal::{
+        self, traits::{DeviceTrait, HostTrait, StreamTrait}, BuildStreamError, FromSample, Sample as CpalSample, SampleFormat as CpalSampleFormat, SizedSample, Stream, StreamConfig, StreamError, SupportedStreamConfig
+    }, Device
+};
+use std::{
+    any::type_name,
+    fs::{self, File},
+    io::BufWriter,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+};
 use tauri::Manager;
 use uuid::Uuid;
 
 // --- 应用状态定义 ---
-// 定义一个结构体来持有应用共享的状态
 struct AppState {
-    is_recording: Mutex<bool>,                      // 标记当前是否正在录音
-    current_recording_path: Mutex<Option<PathBuf>>, // 存储当前录音文件的完整路径 (如果正在录音)
+    is_recording: Mutex<bool>,
+    current_recording_path: Mutex<Option<PathBuf>>,
+    stop_signal_sender: Mutex<Option<Sender<()>>>,
 }
 
-// --- 辅助函数：生成基于 UUID 的文件路径 ---
-// 在应用缓存目录下创建一个唯一的文件路径。
-// 参数:
-//   app_handle: Tauri 应用句柄，用于获取缓存目录路径。
-//   extension: 文件扩展名 (例如 "wav", "mp3")。
-// 返回:
-//   Result<PathBuf, String>: 成功时返回完整的 PathBuf，失败时返回错误信息字符串。
-fn generate_uuid_path(app_handle: &tauri::AppHandle, extension: &str) -> Result<PathBuf, String> {
-    // 1. 获取应用缓存目录
+// --- 错误类型别名 ---
+// 为了简化函数签名，定义一个通用的错误类型
+type Result<T, E = String> = std::result::Result<T, E>;
+
+// --- 辅助函数：文件与路径 ---
+
+// 生成基于 UUID 的文件路径
+// (保持不变)
+fn generate_uuid_path(app_handle: &tauri::AppHandle, extension: &str) -> Result<PathBuf> {
     let cache_dir = app_handle
         .path()
         .app_cache_dir()
         .map_err(|e| format!("获取应用缓存目录失败: {}", e))?;
-
-    // 2. 确保缓存目录存在 (如果不存在则创建)
     fs::create_dir_all(&cache_dir)
         .map_err(|e| format!("无法创建缓存目录 '{}': {}", cache_dir.display(), e))?;
-
-    // 3. 生成一个新的 UUID v4 作为唯一标识符
     let unique_id = Uuid::new_v4();
-
-    // 4. 构建带扩展名的文件名
     let filename = format!("{}.{}", unique_id, extension);
-
-    // 5. 组合缓存目录和文件名，得到完整路径
     let full_path = cache_dir.join(filename);
-
-    Ok(full_path) // 返回成功创建的路径
+    Ok(full_path)
 }
 
-// --- 辅助函数：准备用于处理的音频文件 ---
-// 接收一个原始路径，确保最终处理的文件位于应用缓存目录内。
-// 如果原始文件已在缓存目录中，则直接使用；否则，将其复制到缓存目录并使用 UUID 命名。
-// 参数:
-//   app_handle: Tauri 应用句柄。
-//   original_path: 前端传入的原始文件路径。
-// 返回:
-//   Result<(PathBuf, String), String>:
-//     成功时返回一个元组 (processing_path, display_filename)，其中：
-//       - processing_path: 保证在缓存目录内的、用于实际处理的文件路径。
-//       - display_filename: 用于在前端显示的文件名 (可能是 UUID 文件名或原始文件名)。
-//     失败时返回错误信息字符串。
+// 准备用于处理的音频文件
+// (保持不变)
 fn prepare_audio_file(
     app_handle: &tauri::AppHandle,
-    original_path: &Path, // 接收 Path 引用
-) -> Result<(PathBuf, String), String> {
-    // 获取缓存目录，后续判断和复制需要用到
+    original_path: &Path,
+) -> Result<(PathBuf, String)> {
     let cache_dir = app_handle
         .path()
         .app_cache_dir()
         .map_err(|e| format!("获取应用缓存目录失败: {}", e))?;
-
-    // 检查原始路径是否已经在缓存目录内
     if original_path.starts_with(&cache_dir) {
         println!(
             "后端: 文件 '{}' 已在缓存目录中，直接使用。",
             original_path.display()
         );
-        // 文件名优先使用路径中的文件名，失败则使用整个路径字符串
         let display_filename = original_path.file_name().map_or_else(
             || original_path.to_string_lossy().into_owned(),
             |name| name.to_string_lossy().into_owned(),
         );
-        // 直接返回原始路径和提取的文件名
         Ok((original_path.to_path_buf(), display_filename))
     } else {
-        // 文件来自缓存目录之外 (用户上传)，需要安全地复制进来
         println!(
             "后端: 文件 '{}' 来自外部，将复制到缓存目录并使用 UUID 命名。",
             original_path.display()
         );
-
-        // ** 重要的安全提醒 **
-        // ** 下面的 `fs::copy` 操作需要读取 `original_path`。**
-        // ** 如果 Tauri 的 capabilities (特别是文件系统作用域) 配置不当，**
-        // ** 这仍然可能允许前端通过精心构造的路径读取到非预期的文件。**
-        // ** 最安全的方法是让前端读取文件内容并发送给后端命令，**
-        // ** 由后端命令将内容写入缓存文件。**
-        // ** 此处使用 `fs::copy` 是为了流程演示，生产环境请务必评估风险并采用更安全的策略！**
-
-        // 1. 提取原始文件的扩展名 (若无则默认为 "bin")
+        // --- 安全警告 --- (保持不变)
         let extension = original_path
             .extension()
-            .and_then(|ext| ext.to_str()) // 转换为 &str
-            .map(|ext| ext.to_lowercase()) // 转为小写
-            .unwrap_or_else(|| "bin".to_string()); // 默认值
-
-        // 2. 在缓存目录中生成一个新的、基于 UUID 的目标路径
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_lowercase())
+            .unwrap_or_else(|| "bin".to_string());
         let new_uuid_path = generate_uuid_path(app_handle, &extension)?;
-
-        // 3. 尝试将文件从原始路径复制到新的 UUID 路径
         if let Err(e) = fs::copy(original_path, &new_uuid_path) {
-            // 如果复制过程中发生错误，尝试删除可能已创建的不完整目标文件，防止残留
-            let _ = fs::remove_file(&new_uuid_path); // 忽略删除操作本身可能发生的错误
-            // 返回格式化的错误信息
+            let _ = fs::remove_file(&new_uuid_path);
             return Err(format!(
                 "无法将用户文件 '{}' 复制到 '{}': {}",
                 original_path.display(),
@@ -116,19 +86,199 @@ fn prepare_audio_file(
                 e
             ));
         }
-
-        // 复制成功
         println!("后端: 用户文件已成功复制到 '{}'", new_uuid_path.display());
-
-        // 获取新的 UUID 文件名用于显示
         let display_filename = new_uuid_path.file_name().map_or_else(
-            || format!("未知UUID文件.{}", extension), // 理论上不会失败
+            || format!("未知UUID文件.{}", extension),
             |name| name.to_string_lossy().into_owned(),
         );
-
-        // 返回新的缓存路径和 UUID 文件名
         Ok((new_uuid_path, display_filename))
     }
+}
+
+// --- 辅助函数：音频录制核心逻辑 ---
+
+// 初始化 WAV 写入器
+fn init_wav_writer(
+    path: &Path,
+    spec: WavSpec,
+) -> Result<Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>> {
+    match File::create(path) {
+        Ok(file) => match WavWriter::new(BufWriter::new(file), spec) {
+            Ok(w) => Ok(Arc::new(Mutex::new(Some(w)))),
+            Err(e) => Err(format!("无法创建 WavWriter (spec: {:?}): {}", spec, e)),
+        },
+        Err(e) => Err(format!("无法创建文件 '{}': {}", path.display(), e)),
+    }
+}
+
+// 获取默认音频输入设备和配置
+fn get_default_input_config() -> Result<(Device, SupportedStreamConfig)> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| "找不到默认输入设备".to_string())?;
+    println!(
+        "录音线程: 使用输入设备: {}",
+        device.name().unwrap_or_else(|_| "未知名称".into())
+    );
+    let config = device
+        .default_input_config()
+        .map_err(|e| format!("无法获取默认输入配置: {}", e))?;
+    println!("录音线程: 获取到默认配置: {:?}", config);
+    Ok((device, config))
+}
+
+// 音频数据写入回调辅助函数 (将样本转换为 i16 并写入)
+fn write_input_data<T>(data: &[T], writer_arc: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>)
+where
+    T: CpalSample,      // 输入样本类型
+    i16: FromSample<T>, // 确保可以从 T 转换为 i16
+{
+    if let Some(writer_guard) = writer_arc.lock().as_mut() {
+        for sample in data {
+            let sample_i16: i16 = sample.to_sample::<i16>();
+            if let Err(e) = writer_guard.write_sample(sample_i16) {
+                eprintln!(
+                    "录音线程错误: 写入样本 (i16 from {}) 失败: {}",
+                    type_name::<T>(),
+                    e
+                );
+                // 可以在这里决定是否停止写入，例如设置一个 AtomicBool 标志
+                break;
+            }
+        }
+    }
+}
+
+// 构建 CPAL 输入流的辅助函数
+fn build_input_stream_helper<T>(
+    device: &Device,
+    config: &StreamConfig,
+    writer_arc: Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
+    err_fn: impl FnMut(StreamError) + Send + 'static,
+) -> Result<Stream, BuildStreamError>
+where
+    T: CpalSample + SizedSample + Send + 'static,
+    i16: FromSample<T>,
+{
+    device.build_input_stream(
+        config,
+        move |data: &[T], _: &_| {
+            // 调用独立的写入函数
+            write_input_data::<T>(data, &writer_arc);
+        },
+        err_fn,
+        None, // Timeout
+    )
+}
+
+// 实际录音线程的主函数
+fn record_audio_thread(path: PathBuf, stop_receiver: Receiver<()>) {
+    println!(
+        "录音线程 (rodio 0.20 - 重构): 开始录音到 {}",
+        path.display()
+    );
+
+    // 1. 获取设备和配置
+    let (device, supported_config) = match get_default_input_config() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("录音线程错误: {}", e);
+            return;
+        }
+    };
+    let stream_config = supported_config.config(); // 获取具体的 StreamConfig
+
+    // 2. 准备 WAV 写入器 (使用获取到的配置)
+    let wav_spec = WavSpec {
+        channels: supported_config.channels(),
+        sample_rate: supported_config.sample_rate().0,
+        bits_per_sample: 16, // 固定写入 16位 Int
+        sample_format: SampleFormat::Int,
+    };
+    let writer_arc = match init_wav_writer(&path, wav_spec) {
+        Ok(arc) => arc,
+        Err(e) => {
+            eprintln!("录音线程错误: {}", e);
+            // 尝试清理可能创建的文件
+            let _ = fs::remove_file(&path);
+            return;
+        }
+    };
+
+    // 3. 构建 CPAL 输入流
+    let writer_clone = Arc::clone(&writer_arc);
+    let err_fn = |err: StreamError| {
+        eprintln!("录音线程错误: 音频流错误: {}", err);
+    };
+
+    let stream_result = match supported_config.sample_format() {
+        CpalSampleFormat::I16 => {
+            build_input_stream_helper::<i16>(&device, &stream_config, writer_clone, err_fn)
+        }
+        CpalSampleFormat::F32 => {
+            build_input_stream_helper::<f32>(&device, &stream_config, writer_clone, err_fn)
+        }
+        CpalSampleFormat::I8 => {
+            build_input_stream_helper::<i8>(&device, &stream_config, writer_clone, err_fn)
+        }
+        CpalSampleFormat::I32 => {
+            build_input_stream_helper::<i32>(&device, &stream_config, writer_clone, err_fn)
+        }
+        CpalSampleFormat::U16 => {
+            build_input_stream_helper::<u16>(&device, &stream_config, writer_clone, err_fn)
+        }
+        other_format => {
+            eprintln!("录音线程错误: 不支持的输入样本格式: {:?}", other_format);
+            let _ = fs::remove_file(&path);
+            return;
+        }
+    };
+
+    let stream = match stream_result {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("录音线程错误: 无法构建音频输入流: {}", e);
+            let _ = fs::remove_file(&path);
+            return;
+        }
+    };
+
+    // 4. 启动流、等待停止、完成写入
+    if let Err(e) = stream.play() {
+        eprintln!("录音线程错误: 无法启动音频流: {}", e);
+        let _ = fs::remove_file(&path);
+        return;
+    }
+
+    println!(
+        "录音线程: 音频流已启动 (配置: {:?}), 等待停止信号...",
+        stream_config
+    );
+
+    match stop_receiver.recv() {
+        Ok(_) => println!("录音线程: 收到停止信号。"),
+        Err(e) => eprintln!("录音线程错误: 接收停止信号时出错: {}", e),
+    }
+
+    println!("录音线程: 正在停止音频流并完成文件写入...");
+    drop(stream); // 停止流
+
+    // 5. Finalize WAV 文件
+    if let Some(writer_instance) = writer_arc.lock().take() {
+        if let Err(e) = writer_instance.finalize() {
+            eprintln!("录音线程错误: finalize WavWriter 失败: {}", e);
+        } else {
+            println!("录音线程: 录音文件 {} 写入完成。", path.display());
+        }
+    } else {
+        // Writer 可能在回调中因错误被置为 None，或者初始化时就失败了
+        eprintln!("录音线程警告: WavWriter 实例在 finalize 前已变为 None 或未成功初始化");
+        // 尝试删除不完整的文件
+        let _ = fs::remove_file(&path);
+    }
+
+    println!("录音线程: 退出。");
 }
 
 // --- Tauri 命令 ---
@@ -136,117 +286,97 @@ fn prepare_audio_file(
 // `start_recording` 命令
 #[tauri::command]
 async fn start_recording(
-    state: tauri::State<'_, AppState>, // 访问共享状态
-    app_handle: tauri::AppHandle,      // 访问应用句柄 (用于路径)
-) -> Result<(), String> {
-    // --- 状态锁定 ---
-    // 使用 .lock() 获取 MutexGuard，如果锁被污染则返回错误
+    state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<()> {
     let mut is_recording_guard = state.is_recording.lock();
     let mut current_path_guard = state.current_recording_path.lock();
+    let mut stop_sender_guard = state.stop_signal_sender.lock();
 
-    // --- 前置条件检查 ---
     if *is_recording_guard {
         return Err("已经在录音中".to_string());
     }
-    if current_path_guard.is_some() {
-        // 这是一个潜在的逻辑问题，记录警告但继续 (或者选择返回错误)
-        eprintln!("警告: 录音状态为 false，但 current_recording_path 不为空，将覆盖。");
-        // *current_path_guard = None; // 或者在这里强制清理
+    if current_path_guard.is_some() || stop_sender_guard.is_some() {
+        eprintln!("警告: 状态不一致，将强制重置并开始录音。");
+        *current_path_guard = None;
+        *stop_sender_guard = None;
     }
 
-    // --- 核心逻辑 ---
-    // 1. 生成本次录音的文件路径
-    let new_path = generate_uuid_path(&app_handle, "wav")?; // 假设录音文件格式为 wav
+    let new_path = generate_uuid_path(&app_handle, "wav")?;
+    let path_clone = new_path.clone();
 
-    println!("后端: 开始录音。将保存到: {}", new_path.display());
+    let (sender, receiver) = bounded(1);
 
-    // 2. **【占位符】** 在此启动实际的录音过程
-    //    需要将音频数据流式写入 `new_path` 文件。
-    //    这通常涉及到一个独立的线程或异步任务来处理音频捕获。
-    //    例如: spawn_recording_thread(new_path.clone());
-    //    (注意：如果录音失败，需要处理错误并清理状态)
+    // 启动录音线程
+    thread::spawn(move || {
+        record_audio_thread(path_clone, receiver);
+    });
 
-    // 3. 更新应用状态以反映正在录音
-    *current_path_guard = Some(new_path); // 存储录音路径
-    *is_recording_guard = true; // 标记为正在录音
+    println!("后端: 开始录音指令已发送。将保存到: {}", new_path.display());
 
-    Ok(()) // 表示命令成功完成
+    // 更新状态
+    *current_path_guard = Some(new_path);
+    *stop_sender_guard = Some(sender);
+    *is_recording_guard = true;
+
+    Ok(())
 }
 
 // `stop_recording` 命令
+// (逻辑保持不变)
 #[tauri::command]
-async fn stop_recording(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    // --- 状态锁定 ---
+async fn stop_recording(state: tauri::State<'_, AppState>) -> Result<String> {
     let mut is_recording_guard = state.is_recording.lock();
     let mut current_path_guard = state.current_recording_path.lock();
+    let mut stop_sender_guard = state.stop_signal_sender.lock();
 
-    // --- 前置条件检查 ---
     if !*is_recording_guard {
         return Err("未在录音中，无法停止".to_string());
     }
 
-    // --- 核心逻辑 ---
-    // 1. **【占位符】** 在此停止实际的录音过程
-    //    需要确保所有音频数据已写入文件，并关闭文件句柄。
-    //    例如: signal_recording_thread_to_stop();
-    //          wait_for_recording_thread_completion();
+    if let Some(sender) = stop_sender_guard.take() {
+        println!("后端: 发送停止信号给录音线程...");
+        let _ = sender.send(()); // 忽略发送错误
+    } else {
+        eprintln!("错误: 录音状态为 true 但 stop_signal_sender 为空！");
+        *is_recording_guard = false;
+        *current_path_guard = None;
+        return Err("内部错误：无法找到停止录音的信号通道".to_string());
+    }
 
-    // 2. 从状态中取出 (`.take()`) 录音文件路径
-    //    `.take()` 会将 Option<PathBuf> 中的 PathBuf 移出，并将 Option 置为 None。
     if let Some(path) = current_path_guard.take() {
-        // 成功获取到路径
-        *is_recording_guard = false; // 更新状态为不再录音
-        println!("后端: 停止录音。录音文件: {}", path.display());
-
-        // 3. 将 PathBuf 转换为 String 以便返回给前端
-        let path_str = path
-            .to_string_lossy() // 安全地处理可能无效的 UTF-8 路径
-            .into_owned(); // 转换为拥有的 String
+        *is_recording_guard = false;
+        println!(
+            "后端: 停止录音指令处理完成。录音文件应为: {}",
+            path.display()
+        );
+        let path_str = path.to_string_lossy().into_owned();
         Ok(path_str)
     } else {
-        // 这是一个内部逻辑错误：状态为正在录音，但路径却为 None
-        *is_recording_guard = false; // 无论如何都将状态重置为不再录音
-        eprintln!("错误: 录音状态为 true 但 current_recording_path 为空！");
-        Err("内部错误：无法找到当前录音文件的路径".to_string())
+        *is_recording_guard = false;
+        eprintln!("错误: 停止录音时 current_recording_path 为空！");
+        Err("内部错误：停止录音时未找到文件路径".to_string())
     }
 }
 
 // `transcribe_audio` 命令
+// (逻辑保持不变)
 #[tauri::command]
-async fn transcribe_audio(
-    app_handle: tauri::AppHandle, // 用于访问应用路径和调用辅助函数
-    file_path: String,            // 前端传入的原始文件路径字符串
-) -> Result<String, String> {
+async fn transcribe_audio(app_handle: tauri::AppHandle, file_path: String) -> Result<String> {
     println!("后端: 收到转录请求，原始路径: {}", file_path);
-
-    // --- 文件准备与安全检查 ---
-    // 1. 将字符串路径转换为 PathBuf
     let original_path = PathBuf::from(&file_path);
 
-    // 2. 调用辅助函数，确保我们得到一个在缓存目录内的、可安全处理的文件路径
-    //    `prepare_audio_file` 会处理复制用户上传文件或直接使用缓存文件的逻辑。
     let (processing_path, display_filename) = prepare_audio_file(&app_handle, &original_path)?;
-    // 如果 `prepare_audio_file` 返回错误 (例如复制失败)，错误会在这里 ? 操作符处提前返回。
 
-    // --- 转录逻辑占位符 ---
-    // **【占位符】** 在此执行实际的 Whisper 转录逻辑
-    //    使用 `processing_path` 作为输入文件。
     println!(
         "后端: Whisper 处理占位符（使用安全路径: {}）",
         processing_path.display()
     );
-    // 调用 Whisper 实现，例如:
-    // let transcription_result = match call_whisper_service(&processing_path) {
-    //     Ok(text) => text,
-    //     Err(e) => return Err(format!("Whisper 处理失败: {}", e)),
-    // };
-    // --------------------------
+    // --- 实际 Whisper 调用占位符 ---
 
-    // --- 返回结果 ---
-    // 目前返回硬编码的文本，包含处理时使用的文件名 (UUID 名或原始缓存文件名)
     let hardcoded_transcription = format!(
         "这是来自 Tauri v2 后端的硬编码转录文本。\n处理的文件名: {}",
-        display_filename // 使用 prepare_audio_file 返回的显示文件名
+        display_filename
     );
     println!("后端: 返回硬编码的转录结果。");
     Ok(hardcoded_transcription)
@@ -258,6 +388,7 @@ pub fn run() {
     let initial_state = AppState {
         is_recording: Mutex::new(false),
         current_recording_path: Mutex::new(None),
+        stop_signal_sender: Mutex::new(None),
     };
 
     tauri::Builder::default()
