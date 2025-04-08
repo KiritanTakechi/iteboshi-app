@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::io;
 use thiserror::Error;
 
-#[derive(Debug, Error, Serialize)]
+#[derive(Debug, Error)]
 pub enum AppError {
     #[error("文件系统错误: {0}")]
     Io(String), // 包装 IO 错误信息
@@ -40,7 +40,31 @@ pub enum AppError {
     StopSignalSend(String), // 包装通道发送错误
 
     #[error("Whisper 转录错误: {0}")]
-    Transcription(String), // 为未来的 Whisper 实现预留
+    Transcription(String),
+
+    #[error("模型/配置加载错误: {0}")]
+    ModelLoad(String), // 用于包装 hf-hub 或手动加载错误
+
+    #[error("Candle 核心错误: {0}")]
+    CandleCore(#[from] candle_core::Error), // 使用 #[from]
+
+    #[error("Tokenizer 错误: {0}")]
+    Tokenizer(String), // Tokenizer 错误类型比较复杂，暂时转为 String
+
+    #[error("音频重采样错误: {0}")]
+    Resampling(#[from] rubato::ResampleError), // 使用 #[from]
+
+    #[error("音频预处理错误: {0}")]
+    AudioPreprocessing(String),
+
+    #[error("JSON 解析错误: {0}")]
+    JsonParse(#[from] serde_json::Error),
+
+    #[error("Hugging Face Hub API 错误: {0}")]
+    HfHubApi(#[from] hf_hub::api::tokio::ApiError),
+
+    #[error("模型文件下载失败: {0}")]
+    DownloadFailed(String),
 }
 
 impl From<io::Error> for AppError {
@@ -89,4 +113,28 @@ impl From<SendError<()>> for AppError {
     fn from(e: SendError<()>) -> Self {
         AppError::StopSignalSend(e.to_string())
     }
+}
+
+impl From<tokenizers::Error> for AppError {
+    fn from(e: tokenizers::Error) -> Self {
+        AppError::Tokenizer(e.to_string())
+    }
+}
+
+impl serde::Serialize for AppError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+#[macro_export]
+macro_rules! app_err {
+    (Io, $msg:expr) => { $crate::error::AppError::Io(std::io::Error::new(std::io::ErrorKind::Other, $msg)) };
+    ($variant:ident, $msg:expr) => { $crate::error::AppError::$variant($msg.to_string()) };
+    ($variant:ident, $fmt:expr, $($arg:tt)*) => {
+        $crate::error::AppError::$variant(format!($fmt, $($arg)*))
+    };
 }

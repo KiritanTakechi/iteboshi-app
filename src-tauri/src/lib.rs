@@ -179,6 +179,8 @@ async fn transcribe_audio(app_handle: tauri::AppHandle, file_path: String) -> Re
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     // 创建初始的应用状态
     let initial_state = AppState {
         is_recording: Mutex::new(false),
