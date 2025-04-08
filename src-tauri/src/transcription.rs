@@ -19,7 +19,8 @@ use rand::distr::weighted::WeightedIndex;
 use rand::{SeedableRng, distr::Distribution};
 use rubato::{FftFixedIn, Resampler};
 use std::cmp::min;
-use std::io::Cursor;
+use std::fs::{self, File};
+use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokenizers::Tokenizer;
@@ -83,6 +84,14 @@ impl Model {
             Self::Normal(m) => m.decoder.final_linear(x),
             // Self::Quantized(m) => m.decoder.final_linear(x),
         }
+    }
+    fn reset_kv_cache(&mut self) {
+        match self {
+            Model::Normal(m) => {
+                m.decoder.reset_kv_cache();
+            } // Model::Quantized(m) => { ... }
+        }
+        log::trace!("Model KV Cache 已重置"); // 添加日志确认
     }
 }
 
@@ -208,106 +217,76 @@ fn select_device() -> Result<Device, AppError> {
 /// 加载并预处理音频文件 (期望 16kHz)
 fn preprocess_audio(audio_path: &Path) -> Result<Vec<f32>, AppError> {
     log::info!("预处理音频文件: {}", audio_path.display());
+
+    match fs::metadata(audio_path) {
+        Ok(metadata) => {
+            log::debug!("文件元数据: 大小 = {} bytes", metadata.len());
+            if metadata.len() < 44 {
+                // WAV 文件头至少 44 字节
+                log::warn!("文件大小异常，可能为空或损坏。");
+                // 可以选择在这里返回错误
+                // return Err(app_err!(AudioPreprocessing, "读取的 WAV 文件大小异常"));
+            }
+        }
+        Err(e) => {
+            log::error!("无法获取文件元数据: {}", e);
+            // 也可能在这里返回错误
+            // return Err(AppError::Io(format!("无法获取文件元数据: {}", e)));
+        }
+    }
+
     let mut reader = WavReader::open(audio_path)?;
 
     let spec = reader.spec();
     log::info!("读取 WAV 规范: {:?}", spec);
 
     // --- 1. 读取所有样本并转换为 f32 单声道 ---
-    // (这部分逻辑可以保持，先一次性读入内存简化处理)
-    let samples_f32_result: Result<Vec<f32>, AppError> = match spec.sample_format {
-        SampleFormat::Float => reader
-            .samples::<f32>()
-            .collect::<Result<_, hound::Error>>()
-            .map_err(AppError::from),
-        SampleFormat::Int => match spec.bits_per_sample {
-            16 => {
-                log::debug!("尝试读取 i16 样本...");
-                let mut temp_samples = Vec::new();
-                let mut count = 0;
-                // 手动迭代并转换，方便调试
-                for (i, sample_result) in reader.samples::<i16>().enumerate() {
-                    match sample_result {
-                        Ok(sample) => {
-                            // 归一化
-                            temp_samples.push(sample as f32 / i16::MAX as f32);
-                            count += 1;
-                            if i < 5 {
-                                // 只打印前几个样本的值
-                                log::trace!(
-                                    "Sample[{}]: Ok({}) -> {}",
-                                    i,
-                                    sample,
-                                    temp_samples.last().unwrap()
-                                );
-                            } else if i == 5 {
-                                log::trace!("Sample[{}]: (更多样本...)", i);
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("读取样本 {} 时出错: {}", i, e);
-                            // 返回错误，或者可以选择忽略并继续？这里选择返回错误
-                            return Err(AppError::WavProcessing(format!(
-                                "读取样本 {} 失败: {}",
-                                i, e
-                            )));
-                        }
-                    }
+    let samples_f32: Vec<f32> = match spec.sample_format {
+        SampleFormat::Float => {
+            log::debug!("读取 f32 样本...");
+            // 直接 collect f32 samples
+            reader.samples::<f32>().collect::<Result<_, _>>()? // ? 转换 hound::Error -> AppError
+        }
+        SampleFormat::Int => {
+            match spec.bits_per_sample {
+                16 => {
+                    log::debug!("读取 i16 样本并归一化...");
+                    // 读取所有 i16 样本，然后 map 转换
+                    reader
+                        .samples::<i16>()
+                        .collect::<Result<Vec<_>, _>>()? // 先 collect Vec<i16>
+                        .into_iter() // 转换成迭代器
+                        .map(|s| s as f32 / i16::MAX as f32) // 归一化
+                        .collect() // 收集为 Vec<f32>
                 }
-                log::debug!("成功读取 {} 个 i16 样本", count);
-                Ok(temp_samples)
-            }
-            32 => {
-                log::debug!("尝试读取 i32 样本...");
-                let mut temp_samples = Vec::new();
-                let mut count = 0;
-                for (i, sample_result) in reader.samples::<i32>().enumerate() {
-                    match sample_result {
-                        Ok(sample) => {
-                            temp_samples.push(sample as f32 / i32::MAX as f32);
-                            count += 1;
-                            if i < 5 {
-                                log::trace!(
-                                    "Sample[{}]: Ok({}) -> {}",
-                                    i,
-                                    sample,
-                                    temp_samples.last().unwrap()
-                                );
-                            } else if i == 5 {
-                                log::trace!("Sample[{}]: (更多样本...)", i);
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("读取样本 {} 时出错: {}", i, e);
-                            return Err(AppError::WavProcessing(format!(
-                                "读取样本 {} 失败: {}",
-                                i, e
-                            )));
-                        }
-                    }
+                32 => {
+                    log::debug!("读取 i32 样本并归一化...");
+                    reader
+                        .samples::<i32>()
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .map(|s| s as f32 / i32::MAX as f32)
+                        .collect()
                 }
-                log::debug!("成功读取 {} 个 i32 样本", count);
-                Ok(temp_samples)
+                // 可以添加对 i8, i24 (如果 hound 支持) 的处理
+                // 8 => reader.samples::<i8>()...
+                _ => {
+                    return Err(app_err!(
+                        AudioPreprocessing,
+                        "不支持的整数位深: {}",
+                        spec.bits_per_sample
+                    ));
+                }
             }
-            _ => Err(app_err!(
-                AudioPreprocessing,
-                "不支持的整数位深: {}",
-                spec.bits_per_sample
-            )),
-        },
+        }
     };
-
-    let samples_interleaved = samples_f32_result?; // 获取结果或传播错误
-    log::info!(
-        "读取并转换为 f32 样本完成，数量: {}",
-        samples_interleaved.len()
-    ); // <-- 再次检查这里的数量
+    log::info!("读取并转换为 f32 样本完成，数量: {}", samples_f32.len());
 
     let samples_mono: Vec<f32> = if spec.channels == 1 {
-        samples_interleaved
+        samples_f32
     } else if spec.channels > 1 {
         log::info!("将 {} 声道转为单声道...", spec.channels);
-        samples_interleaved
+        samples_f32
             .chunks_exact(spec.channels as usize)
             .map(|chunk| chunk.iter().sum::<f32>() / spec.channels as f32)
             .collect()
@@ -638,177 +617,122 @@ impl<'a> Decoder<'a> {
         })
     }
 
-    // --- decode_segment 方法 (核心解码逻辑) ---
-    fn decode_segment(
+    fn predict_next_token(
         &mut self,
-        audio_features: &Tensor,
-        temperature: f64,
-    ) -> Result<DecodingResult> {
-        let start_time = Instant::now();
-        let mut tokens = vec![self.sot_token]; // Start with SOT
+        tokens: &[u32],          // 当前序列
+        audio_features: &Tensor, // Encoder 输出
+        is_first_step: bool,     // 是否是第一步
+        temperature: f64,        // 解码温度
+    ) -> Result<(u32, f64), AppError> {
+        // 返回 (next_token, logprob)
+        let tokens_tensor = Tensor::new(tokens, self.device)?.unsqueeze(0)?;
+        let decoder_output =
+            self.model
+                .decoder_forward(&tokens_tensor, audio_features, is_first_step)?;
+        let (_, seq_len, _) = decoder_output.dims3()?;
+        let logits = self
+            .model
+            .decoder_final_linear(
+                &decoder_output.i((..1, seq_len - 1..))?, // 取最后一个时间步
+            )?
+            .i(0)?
+            .i(0)?;
+        let logits = logits.broadcast_add(&self.suppress_tokens)?;
 
-        // --- 语言和任务 Token 处理 ---
-        // 如果是多语言模型且未设置语言，此时 language_token 仍为 None
-        // 如果已设置（例如通过外部参数传入并存储），则直接使用
-        if let Some(lang_token) = self.language_token {
-            tokens.push(lang_token);
-        } // 否则，不在这一步添加语言 token (语言检测已在外部完成)
+        let next_token = if temperature > 0.0 {
+            let prs = softmax(&(&logits / temperature)?, 0)?;
+            let logits_v: Vec<f32> = prs.to_vec1()?;
+            let distr = WeightedIndex::new(&logits_v)
+                .map_err(|e| app_err!(Transcription, "创建采样分布失败: {}", e))?;
+            distr.sample(&mut self.rng) as u32
+        } else {
+            logits.argmax(D::Minus1)?.to_scalar::<u32>()?
+        };
 
-        // 添加任务 token
-        match self.task {
-            None | Some(Task::Transcribe) => tokens.push(self.transcribe_token),
-            Some(Task::Translate) => tokens.push(self.translate_token),
-        }
-        // 添加时间戳 token (如果不需要时间戳)
-        if !self.timestamps {
-            tokens.push(self.no_timestamps_token);
-        }
+        let probs = softmax(&logits, D::Minus1)?;
+        let logprob = match probs.i(next_token as usize)?.to_scalar::<f32>()? as f64 {
+            p if p > 0.0 => p.ln(),
+            _ => f64::NEG_INFINITY,
+        };
 
-        // --- 解码循环 ---
-        let mut sum_logprob = 0f64;
-        let mut no_speech_prob = f64::NAN;
-        let sample_len = self.model.config().max_target_positions / 2;
-
-        for i in 0..sample_len {
-            let tokens_tensor = Tensor::new(tokens.as_slice(), self.device)?;
-            let tokens_tensor = tokens_tensor.unsqueeze(0)?;
-
-            let decoder_output =
-                self.model
-                    .decoder_forward(&tokens_tensor, audio_features, i == 0)?;
-            let (_, seq_len, _) = decoder_output.dims3()?;
-            let logits = self
-                .model
-                .decoder_final_linear(&decoder_output.i((..1, seq_len - 1..))?)?
-                .i(0)?
-                .i(0)?;
-
-            if i == 0 {
-                // 获取 no_speech_prob
-                no_speech_prob = softmax(&logits, 0)?
-                    .i(self.no_speech_token as usize)?
-                    .to_scalar::<f32>()? as f64;
-            }
-
-            let logits = logits.broadcast_add(&self.suppress_tokens)?;
-
-            // 采样
-            let next_token = if temperature > 0.0 {
-                let prs = softmax(&(&logits / temperature)?, 0)?;
-                let logits_v: Vec<f32> = prs.to_vec1()?;
-                let distr = WeightedIndex::new(&logits_v)
-                    .map_err(|e| app_err!(Transcription, "创建采样分布失败: {}", e))?;
-                distr.sample(&mut self.rng) as u32
-            } else {
-                // 贪心
-                logits.argmax(D::Minus1)?.to_scalar::<u32>()? // 使用 argmax
-            };
-            tokens.push(next_token);
-
-            // 计算 logprob (用于回退逻辑，如果实现的话)
-            let prob = softmax(&logits, D::Minus1)?
-                .i(next_token as usize)?
-                .to_scalar::<f32>()? as f64;
-            if prob > 0.0 {
-                sum_logprob += prob.ln();
-            } else {
-                sum_logprob += f64::NEG_INFINITY;
-            }
-
-            if next_token == self.eot_token
-                || tokens.len() > self.model.config().max_target_positions
-            {
-                break;
-            }
-        }
-
-        let text = self
-            .tokenizer
-            .decode(&tokens, true)
-            .map_err(AppError::from)?;
-        let avg_logprob = sum_logprob / tokens.len().saturating_sub(1) as f64;
-
-        log::debug!(
-            "解码段落 - avg_logprob: {}, no_speech_prob: {}",
-            avg_logprob,
-            no_speech_prob
-        );
-
-        if self.verbose { /* ... log ... */ }
-
-        log::debug!("解码段落 - 原始 Tokens: {:?}", tokens); // <-- 添加日志
-        log::debug!("解码段落 - 解码文本: '{}'", text); // <-- 添加日志 (确认 tokenizer 行为)
-
-        Ok(DecodingResult {
-            tokens,
-            text,
-            avg_logprob,
-            no_speech_prob,
-            temperature,
-        })
+        Ok((next_token, logprob))
     }
 
     // --- run 方法 (处理分块和调用 decode_segment) ---
     // 改编自官方示例的 run 方法
     fn run(
         &mut self,
-        mel_features: &Tensor,
+        audio_features: &Tensor, // 接收完整的 Encoder 输出
         language: Option<String>,
-    ) -> Result<Vec<DecodingResult>> {
-        let (_, _, content_frames) = mel_features.dims3()?;
-        let mut seek = 0;
-        let mut decoding_results = vec![];
-
-        // --- 确定语言 Token (只执行一次) ---
+        temperature: f64, // 接收温度参数
+    ) -> Result<String> {
+        // --- 1. 确定语言 Token (只执行一次) ---
         self.language_token = match language {
-            Some(lang) => {
-                let token_str = format!("<|{}|>", lang.to_lowercase());
-                Some(token_id(self.tokenizer, &token_str)?)
-            }
+            Some(lang) => Some(token_id(
+                self.tokenizer,
+                &format!("<|{}|>", lang.to_lowercase()),
+            )?),
             None => {
                 log::info!("未指定语言，进行自动检测...");
-                let initial_mel_segment =
-                    mel_features.narrow(2, 0, usize::min(content_frames, N_FRAMES))?;
-                let audio_features_for_lang_detect =
-                    self.model.encoder_forward(&initial_mel_segment, true)?;
+                // 需要 Encoder 输出进行检测
                 let detected_lang_token =
-                    detect_language(self.model, self.tokenizer, &audio_features_for_lang_detect)?;
+                    detect_language(self.model, self.tokenizer, audio_features)?;
                 log::info!("检测到语言 token: {}", detected_lang_token);
                 Some(detected_lang_token)
             }
         };
 
-        // --- 处理音频块 ---
-        while seek < content_frames {
-            let start_time = Instant::now();
-            // let time_offset = (seek * HOP_LENGTH) as f64 / SAMPLE_RATE as f64; // 用于时间戳
-            let segment_size = usize::min(content_frames - seek, N_FRAMES);
-            let mel_segment = mel_features.narrow(2, seek, segment_size)?;
-            // let segment_duration = (segment_size * HOP_LENGTH) as f64 / SAMPLE_RATE as f64; // 用于时间戳
-
-            // 调用 decode_segment (或 decode_with_fallback 如果实现)
-            // 暂时只用贪心解码 (temperature = 0.0)
-            let dr = self.decode_segment(&mel_segment, 0.0)?;
-
-            seek += segment_size;
-
-            // --- 可以添加官方示例中的回退和无语音检查逻辑 ---
-            // if dr.no_speech_prob > m::NO_SPEECH_THRESHOLD && dr.avg_logprob < m::LOGPROB_THRESHOLD { ... continue ... }
-
-            if self.verbose {
-                log::debug!(
-                    "Segment [{}->{} frames] decoded in {}ms: '{}'",
-                    seek - segment_size,
-                    seek,
-                    start_time.elapsed().as_millis(),
-                    dr.text
-                );
-            }
-            // 简单地将结果添加到列表
-            decoding_results.push(dr);
-            // 可以在这里实现时间戳打印（如果 timestamps == true）
+        // --- 2. 初始化解码序列 ---
+        let mut tokens = vec![self.sot_token];
+        if let Some(lang_token) = self.language_token {
+            tokens.push(lang_token);
         }
-        Ok(decoding_results)
+        match self.task {
+            None | Some(Task::Transcribe) => tokens.push(self.transcribe_token),
+            Some(Task::Translate) => tokens.push(self.translate_token),
+        }
+        if !self.timestamps {
+            tokens.push(self.no_timestamps_token);
+        }
+
+        // --- 3. 解码主循环 ---
+        let mut all_tokens = tokens.clone(); // 存储完整序列，包括初始 tokens
+        let sample_len = self.model.config().max_target_positions; // 最大解码步数
+
+        for i in 0..sample_len {
+            // --- 关键修改：调用 predict_next_token ---
+            let (next_token, _logprob) = self.predict_next_token(
+                &tokens, // 传递当前已生成的序列 tokens
+                audio_features,
+                i == 0,      // 第一次迭代 flush=true
+                temperature, // 传递温度
+            )?;
+            // --- 修改结束 ---
+
+            tokens.push(next_token); // 添加到当前序列 (用于下一步预测)
+            all_tokens.push(next_token); // 添加到完整序列
+
+            if next_token == self.eot_token {
+                log::debug!("解码在第 {} 步遇到 EOT token。", i + 1);
+                break;
+            }
+        }
+        if tokens.len() >= sample_len + (all_tokens.len() - tokens.len()) {
+            // 稍微修正长度检查
+            log::warn!("解码达到最大长度 {}，可能未正常结束。", sample_len);
+        }
+
+        // --- 4. 最终解码完整文本 ---
+        let final_text = self
+            .tokenizer
+            .decode(&all_tokens, true)
+            .map_err(AppError::from)?;
+
+        if self.verbose {
+            log::debug!("最终解码 Tokens: {:?}", all_tokens);
+        }
+
+        Ok(final_text)
     }
 }
 
@@ -821,6 +745,7 @@ pub async fn run_whisper(
     task: Option<Task>,
     timestamps: bool,
     verbose: bool,
+    temperature: f64,
 ) -> Result<String, AppError> {
     log::info!(
         "开始处理文件 '{}', task: {:?}, language: {:?}, timestamps: {}",
@@ -839,18 +764,21 @@ pub async fn run_whisper(
         .map_err(|e| app_err!(Transcription, "音频预处理任务 join 失败: {}", e))??;
     log::info!("预处理完成，样本数: {}", samples_f32.len());
 
+    if samples_f32.is_empty() {
+        log::warn!("预处理后的音频样本为空，无法进行转录。");
+        return Ok("".to_string());
+    }
+
     log::info!("执行 Whisper 推理...");
     let transcription = tokio::task::spawn_blocking(move || {
         log::debug!("获取模型锁...");
         let mut components = components_mutex.blocking_lock();
-        // 注意：这里 components 是 MutexGuard，whisper_components 是可变借用
+
         let whisper_components = &mut *components;
         log::debug!("模型锁已获取。");
 
-        log::info!("重置模型内部状态 (KV Cache)...");
-        match &mut whisper_components.model {
-            Model::Normal(m) => m.reset_kv_cache(),
-        }
+        log::info!("重置模型 Decoder KV Cache...");
+        whisper_components.model.reset_kv_cache();
         log::info!("模型状态已重置。");
 
         // --- 计算 Mel 特征 ---
@@ -905,14 +833,8 @@ pub async fn run_whisper(
 
         // --- 关键修正：调用 run 时传入 audio_features ---
         log::info!("调用 decoder.run 处理 audio_features...");
-        let results: Vec<DecodingResult> = decoder.run(&audio_features, language)?;
+        let final_text = decoder.run(&audio_features, language, temperature)?;
 
-        // --- 连接结果 ---
-        let final_text = results
-            .iter()
-            .map(|r| r.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
         log::info!("解码完成。最终文本长度: {}", final_text.len());
         log::debug!("最终拼接文本: '{}'", final_text);
 

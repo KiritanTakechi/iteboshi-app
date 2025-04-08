@@ -149,6 +149,9 @@ async fn stop_recording(state: tauri::State<'_, AppState>) -> Result<String> {
         *is_recording_guard = false;
         println!("Lib: 停止录音指令处理完成。文件: {}", path.display());
         let path_str = path.to_string_lossy().into_owned();
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
         Ok(path_str)
     } else {
         *is_recording_guard = false;
@@ -184,6 +187,7 @@ async fn transcribe_audio(
     // let task: Option<crate::transcription::Task> = None; // 或者让 Whisper 决定 (但不推荐)
     let timestamps: bool = false; // 默认不输出时间戳
     let verbose: bool = false; // 默认不打印详细解码日志 (可以用 RUST_LOG=debug 控制)
+    let temperature: f64 = 0.0; // 默认温度 (0.0 = 不随机化)
 
     // --- 扩展：从前端接收参数 ---
     // 如果修改了命令签名以接收前端参数，则可以直接使用这些参数：
@@ -194,12 +198,13 @@ async fn transcribe_audio(
 
     // 3. 调用 transcription 模块处理文件，传递所有参数
     println!(
-        "Lib: 调用转录模块处理文件: {} (Lang: {:?}, Task: {:?}, TS: {}, Verbose: {})",
+        "Lib: 转录模块开始处理文件: {} (语言: {:?}, 任务: {:?}, 时间戳: {}, 详细: {}, 温度: {})",
         processing_path.display(),
         language,
         task,
         timestamps,
-        verbose
+        verbose,
+        temperature
     );
 
     let transcription_result = crate::transcription::run_whisper(
@@ -210,6 +215,7 @@ async fn transcribe_audio(
         task,
         timestamps,
         verbose,
+        temperature,
     )
     .await?; // 使用 await 和 ?
 
