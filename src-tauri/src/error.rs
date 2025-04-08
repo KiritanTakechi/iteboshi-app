@@ -3,7 +3,7 @@ use hound;
 use rodio::cpal::{
     BuildStreamError, DefaultStreamConfigError, DevicesError, PlayStreamError, StreamError,
 };
-use serde::Serialize;
+use rubato::{ResampleError, ResamplerConstructionError};
 use std::io;
 use thiserror::Error;
 
@@ -52,7 +52,7 @@ pub enum AppError {
     Tokenizer(String), // Tokenizer 错误类型比较复杂，暂时转为 String
 
     #[error("音频重采样错误: {0}")]
-    Resampling(#[from] rubato::ResampleError), // 使用 #[from]
+    Resampling(String),
 
     #[error("音频预处理错误: {0}")]
     AudioPreprocessing(String),
@@ -61,10 +61,13 @@ pub enum AppError {
     JsonParse(#[from] serde_json::Error),
 
     #[error("Hugging Face Hub API 错误: {0}")]
-    HfHubApi(#[from] hf_hub::api::tokio::ApiError),
+    HfHubApi(String),
 
     #[error("模型文件下载失败: {0}")]
     DownloadFailed(String),
+
+    #[error("不支持的操作: {0}")]
+    Unsupported(String),
 }
 
 impl From<io::Error> for AppError {
@@ -118,6 +121,30 @@ impl From<SendError<()>> for AppError {
 impl From<tokenizers::Error> for AppError {
     fn from(e: tokenizers::Error) -> Self {
         AppError::Tokenizer(e.to_string())
+    }
+}
+
+impl From<ResampleError> for AppError {
+    fn from(e: ResampleError) -> Self {
+        AppError::Resampling(format!("运行时重采样失败: {}", e))
+    }
+}
+
+impl From<ResamplerConstructionError> for AppError {
+    fn from(e: ResamplerConstructionError) -> Self {
+        AppError::Resampling(format!("重采样器构建失败: {}", e))
+    }
+}
+
+impl From<hf_hub::api::sync::ApiError> for AppError {
+    fn from(e: hf_hub::api::sync::ApiError) -> Self {
+        AppError::HfHubApi(e.to_string())
+    }
+}
+
+impl From<hf_hub::api::tokio::ApiError> for AppError {
+    fn from(e: hf_hub::api::tokio::ApiError) -> Self {
+        AppError::HfHubApi(e.to_string())
     }
 }
 

@@ -10,6 +10,7 @@ use tauri::Manager;
 use uuid::Uuid;
 
 mod error;
+mod multilingual;
 mod recorder;
 mod transcription;
 
@@ -160,18 +161,57 @@ async fn stop_recording(state: tauri::State<'_, AppState>) -> Result<String> {
 
 // `transcribe_audio` 命令
 #[tauri::command]
-async fn transcribe_audio(app_handle: tauri::AppHandle, file_path: String) -> Result<String> {
+async fn transcribe_audio(
+    app_handle: tauri::AppHandle,
+    file_path: String,
+    // --- 扩展：从前端接收参数 (示例) ---
+    // #[serde(default)] language: Option<String>, // 使用 serde default 允许前端不传
+    // #[serde(default = "default_task")] task: Task, // 需要定义 default_task() -> Task
+    // #[serde(default)] timestamps: bool,
+    // #[serde(default)] verbose: bool,
+) -> Result<String> {
+    // 返回 Result<String, AppError>
+
     println!("Lib: 收到转录请求，原始路径: {}", file_path);
     let original_path = PathBuf::from(&file_path);
 
-    // 1. 准备文件（复制或直接使用缓存路径）
+    // 1. 准备文件
     let (processing_path, display_filename) = prepare_audio_file(&app_handle, &original_path)?;
 
-    // 2. 调用 transcription 模块处理文件
-    println!("Lib: 调用转录模块处理文件: {}", processing_path.display());
-    // 使用 ? 将转录模块的错误传递出去
-    let transcription_result =
-        crate::transcription::run_whisper(&processing_path, &display_filename).await?;
+    // 2. 设置解码参数 (当前使用默认值)
+    let language: Option<String> = Some("zh".to_string()); // None = 自动检测 (如果模型支持)
+    let task: Option<crate::transcription::Task> = Some(crate::transcription::Task::Transcribe); // 默认转录
+    // let task: Option<crate::transcription::Task> = None; // 或者让 Whisper 决定 (但不推荐)
+    let timestamps: bool = false; // 默认不输出时间戳
+    let verbose: bool = false; // 默认不打印详细解码日志 (可以用 RUST_LOG=debug 控制)
+
+    // --- 扩展：从前端接收参数 ---
+    // 如果修改了命令签名以接收前端参数，则可以直接使用这些参数：
+    // let language = language; // 直接使用从前端反序列化的 language
+    // let task = Some(task); // 直接使用从前端反序列化的 task (需要 Task 实现 Deserialize 或有默认值)
+    // let timestamps = timestamps;
+    // let verbose = verbose;
+
+    // 3. 调用 transcription 模块处理文件，传递所有参数
+    println!(
+        "Lib: 调用转录模块处理文件: {} (Lang: {:?}, Task: {:?}, TS: {}, Verbose: {})",
+        processing_path.display(),
+        language,
+        task,
+        timestamps,
+        verbose
+    );
+
+    let transcription_result = crate::transcription::run_whisper(
+        app_handle, // 传递 app_handle
+        &processing_path,
+        &display_filename,
+        language,
+        task,
+        timestamps,
+        verbose,
+    )
+    .await?; // 使用 await 和 ?
 
     println!("Lib: 转录模块处理完成。");
     Ok(transcription_result)
@@ -179,7 +219,7 @@ async fn transcribe_audio(app_handle: tauri::AppHandle, file_path: String) -> Re
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
 
     // 创建初始的应用状态
     let initial_state = AppState {

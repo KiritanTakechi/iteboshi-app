@@ -90,10 +90,7 @@ where
 
 // 实际录音线程的主函数
 fn record_audio_thread_internal(path: PathBuf, stop_receiver: Receiver<()>) {
-    println!(
-        "录音线程 (rodio 0.20 - 更正2): 开始录音到 {}",
-        path.display()
-    );
+    println!("录音线程: 开始录音到 {}", path.display());
 
     // --- 1. 初始化准备工作 ---
     // 将可能失败的操作放在前面，并将结果存储起来

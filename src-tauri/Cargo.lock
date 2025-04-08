@@ -2701,6 +2701,7 @@ checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
 name = "iteboshi"
 version = "0.1.0"
 dependencies = [
+ "byteorder",
  "candle-core",
  "candle-nn",
  "candle-transformers",
@@ -2710,6 +2711,7 @@ dependencies = [
  "hound",
  "log",
  "parking_lot",
+ "rand 0.9.0",
  "rodio",
  "rubato",
  "serde",
