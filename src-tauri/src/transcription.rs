@@ -699,14 +699,12 @@ impl<'a> Decoder<'a> {
         let sample_len = self.model.config().max_target_positions; // 最大解码步数
 
         for i in 0..sample_len {
-            // --- 关键修改：调用 predict_next_token ---
             let (next_token, _logprob) = self.predict_next_token(
                 &tokens, // 传递当前已生成的序列 tokens
                 audio_features,
                 i == 0,      // 第一次迭代 flush=true
                 temperature, // 传递温度
             )?;
-            // --- 修改结束 ---
 
             tokens.push(next_token); // 添加到当前序列 (用于下一步预测)
             all_tokens.push(next_token); // 添加到完整序列

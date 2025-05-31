@@ -2721,6 +2721,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tauri-plugin-upload",
  "thiserror 2.0.12",
  "tokenizers",
  "tokio",
@@ -4420,6 +4421,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "read-progress-stream"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6435842fc2fea44b528719eb8c32203bbc1bb2f5b619fbe0c0a3d8350fd8d2a8"
+dependencies = [
+ "bytes",
+ "futures",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "realfft"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5697,6 +5709,25 @@ dependencies = [
  "url",
  "windows 0.60.0",
  "zbus",
+]
+
+[[package]]
+name = "tauri-plugin-upload"
+version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e90ac6d3a783d4406caeae8c75aa05e96346474765517fddfd1dc313ff91aa89"
+dependencies = [
+ "futures-util",
+ "log",
+ "read-progress-stream",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

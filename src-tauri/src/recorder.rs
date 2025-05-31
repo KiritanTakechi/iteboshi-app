@@ -2,7 +2,7 @@
 
 //! 负责音频录制的核心逻辑
 
-use crate::error::AppError; 
+use crate::error::AppError;
 use crossbeam_channel::Receiver;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use parking_lot::Mutex;

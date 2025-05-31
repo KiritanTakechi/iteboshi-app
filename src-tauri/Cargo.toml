@@ -45,6 +45,7 @@ candle-nn = { version = "0.9" }
 candle-transformers = { version = "0.9" }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 hf-hub = { version = "0.4", features = ["tokio"] }
+tauri-plugin-upload = "2"
 
 [features]
 default = ["metal"]
