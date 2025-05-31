@@ -7,11 +7,11 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_nn::ops::softmax;
+use candle_transformers::models::whisper::Config;
 use candle_transformers::models::whisper::{
     self, EOT_TOKEN, NO_SPEECH_TOKENS, NO_TIMESTAMPS_TOKEN, SAMPLE_RATE, SOT_TOKEN,
     TRANSCRIBE_TOKEN, TRANSLATE_TOKEN, audio, model::Whisper,
 };
-use candle_transformers::models::whisper::{Config, N_FRAMES};
 use hf_hub::RepoType;
 use hf_hub::api::tokio::{Api, ApiRepo};
 use hound::{self, SampleFormat, WavReader};
@@ -19,10 +19,9 @@ use rand::distr::weighted::WeightedIndex;
 use rand::{SeedableRng, distr::Distribution};
 use rubato::{FftFixedIn, Resampler};
 use std::cmp::min;
-use std::fs::{self, File};
-use std::io::{BufReader, Cursor};
+use std::fs::{self};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::OnceCell;
@@ -33,7 +32,7 @@ type Result<T, E = AppError> = std::result::Result<T, E>; // 使用 AppError
 const WHISPER_SAMPLING_RATE: u32 = SAMPLE_RATE as u32; // 16000
 const MAX_AUDIO_LENGTH_SECS: u32 = 30;
 const SAMPLES_PER_CHUNK: usize = (WHISPER_SAMPLING_RATE * MAX_AUDIO_LENGTH_SECS) as usize;
-const MODEL_ID: &str = "openai/whisper-base";
+const MODEL_ID: &str = "kiritan/iteboshi-medium";
 const REVISION: &str = "main";
 
 // --- 全局状态 ---
