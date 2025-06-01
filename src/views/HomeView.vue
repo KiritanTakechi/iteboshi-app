@@ -130,13 +130,13 @@ async function startRecording() {
 
 // 调用后端停止录音的命令
 async function stopRecording() {
-  console.log("占位符：调用后端 stop_recording 命令...");
+  console.log("调用后端 stop_recording 命令...");
   currentState.value = "processing"; // 进入处理状态
   try {
     // --- 实际调用 Rust 后端命令 ---
     // 假设后端停止录音后，会返回录音文件的路径
     const resultPath = await invoke<string>("stop_recording");
-    console.log("占位符：后端 stop_recording 命令成功，返回路径:", resultPath);
+    console.log("后端 stop_recording 命令成功，返回路径:", resultPath);
     if (resultPath) {
       await processAudio(resultPath); // 处理返回的录音文件
     } else {
@@ -148,7 +148,7 @@ async function stopRecording() {
     // console.log('占位符：模拟录音停止，文件：', mockRecordingPath);
     // await processAudio(mockRecordingPath);
   } catch (err) {
-    console.error("占位符：调用 stop_recording 或后续处理失败:", err);
+    console.error("调用 stop_recording 或后续处理失败:", err);
     errorMessage.value = `停止录音或处理失败: ${err instanceof Error ? err.message : String(err)}`;
     currentState.value = "error";
   }
@@ -159,13 +159,13 @@ async function processAudio(filePath: string) {
   currentState.value = "processing"; // 确保处于处理状态
   errorMessage.value = null;
   // transcription.value = ''; // 可选：处理前清空旧结果，或保留以显示加载状态
-  console.log(`占位符：调用后端 transcribe_audio 命令处理文件： ${filePath}`);
+  console.log(`调用后端 transcribe_audio 命令处理文件： ${filePath}`);
   try {
     // --- 实际调用 Rust 后端命令 ---
     const result = await invoke<string>("transcribe_audio", {
       filePath: filePath,
     }); // 传递参数
-    console.log("占位符：后端 transcribe_audio 命令成功，结果：", result);
+    console.log("后端 transcribe_audio 命令成功，结果：", result);
     transcription.value = result; // 显示转录结果
     currentState.value = "success"; // 设置状态为成功
 
@@ -175,7 +175,7 @@ async function processAudio(filePath: string) {
     // transcription.value = mockResult;
     // currentState.value = 'success';
   } catch (err) {
-    console.error("占位符：调用 transcribe_audio 命令失败:", err);
+    console.error("调用 transcribe_audio 命令失败:", err);
     errorMessage.value = `处理音频失败: ${err instanceof Error ? err.message : String(err)}`;
     currentState.value = "error";
   }
@@ -190,7 +190,7 @@ let unlistenCancel: (() => void) | null = null;
 onMounted(async () => {
   try {
     // 监听文件悬停在窗口上方的事件
-    unlistenHover = await listen<string[]>("tauri://file-drop-hover", () => {
+    unlistenHover = await listen<string[]>("tauri://drag-over", () => {
       // 只有在非录音/处理状态下才响应拖放悬停
       if (
         currentState.value !== "recording" &&
@@ -201,7 +201,7 @@ onMounted(async () => {
     });
 
     // 监听文件在窗口上方释放 (放下) 的事件
-    unlistenDrop = await listen<string[]>("tauri://file-drop", (event) => {
+    unlistenDrop = await listen<string[]>("tauri://drag-drop", (event) => {
       isDragging.value = false; // 移除视觉反馈
       // 只有在非录音/处理状态下才处理文件
       if (
@@ -231,7 +231,7 @@ onMounted(async () => {
     });
 
     // 监听拖放操作被取消的事件 (例如文件拖出窗口)
-    unlistenCancel = await listen<null>("tauri://file-drop-cancelled", () => {
+    unlistenCancel = await listen<null>("tauri://drag-leave", () => {
       isDragging.value = false; // 移除视觉反馈
     });
   } catch (error) {
