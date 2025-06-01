@@ -16,8 +16,8 @@ import StatusIndicator from "../components/StatusIndicator.vue";
 import { invoke } from "@tauri-apps/api/core";
 // 导入 dialog 插件的 open 函数用于文件选择
 import { open } from "@tauri-apps/plugin-dialog";
-// 导入 event 模块的 listen 函数用于监听拖放等事件
-import { listen } from "@tauri-apps/api/event";
+// 导入 webviewWindow API 用于新的拖放事件
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 // 定义应用可能的状态类型
 type AppState =
@@ -181,70 +181,71 @@ async function processAudio(filePath: string) {
   }
 }
 
-// --- 文件拖放事件监听 (使用 Tauri 内置事件) ---
-let unlistenDrop: (() => void) | null = null;
-let unlistenHover: (() => void) | null = null;
-let unlistenCancel: (() => void) | null = null;
+// --- 文件拖放事件监听 (使用 getCurrentWebview().onDragDropEvent()) ---
+let unlistenDragDrop: (() => void) | null = null;
 
 // 在组件挂载时设置监听器
 onMounted(async () => {
   try {
-    // 监听文件悬停在窗口上方的事件
-    unlistenHover = await listen<string[]>("tauri://drag-over", () => {
-      // 只有在非录音/处理状态下才响应拖放悬停
-      if (
-        currentState.value !== "recording" &&
-        currentState.value !== "processing"
-      ) {
-        isDragging.value = true; // 更新状态以显示视觉反馈
+    const currentWebview = getCurrentWebview();
+    unlistenDragDrop = await currentWebview.onDragDropEvent((event) => {
+      if (currentState.value === "recording" || currentState.value === "processing") {
+        // 如果正在录音或处理，则不响应任何拖放事件，并确保 isDragging 为 false
+        isDragging.value = false;
+        return;
       }
-    });
 
-    // 监听文件在窗口上方释放 (放下) 的事件
-    unlistenDrop = await listen<string[]>("tauri://drag-drop", (event) => {
-      isDragging.value = false; // 移除视觉反馈
-      // 只有在非录音/处理状态下才处理文件
-      if (
-        currentState.value !== "recording" &&
-        currentState.value !== "processing"
-      ) {
-        const filePath = event.payload[0]; // 获取第一个拖放文件的路径
-        if (filePath) {
-          // 简单地基于文件扩展名检查文件类型 (后端最好做更严格的检查)
-          const lowerPath = filePath.toLowerCase();
-          if (
-            lowerPath.endsWith(".wav") ||
-            lowerPath.endsWith(".mp3") ||
-            lowerPath.endsWith(".m4a") ||
-            lowerPath.endsWith(".ogg") ||
-            lowerPath.endsWith(".flac")
-          ) {
-            selectedFileName.value = filePath.split(/[\\/]/).pop() ?? filePath; // 显示文件名
-            processAudio(filePath); // 使用真实路径处理
-          } else {
-            errorMessage.value = "请拖放有效的音频文件";
-            currentState.value = "error";
-            console.warn("拖放的文件类型不被支持:", filePath);
+      switch (event.payload.type) {
+        case "over":
+          isDragging.value = true;
+          console.log('User hovering at position', event.payload.position);
+          break;
+        case "drop":
+          isDragging.value = false;
+          console.log('User dropped files', event.payload.paths, 'at position', event.payload.position);
+          const filePath = event.payload.paths[0]; // 获取第一个拖放文件的路径
+          if (filePath) {
+            // 简单地基于文件扩展名检查文件类型 (后端最好做更严格的检查)
+            const lowerPath = filePath.toLowerCase();
+            if (
+              lowerPath.endsWith(".wav") ||
+              lowerPath.endsWith(".mp3") ||
+              lowerPath.endsWith(".m4a") ||
+              lowerPath.endsWith(".ogg") ||
+              lowerPath.endsWith(".flac")
+            ) {
+              selectedFileName.value = filePath.split(/[\\/]/).pop() ?? filePath; // 显示文件名
+              processAudio(filePath); // 使用真实路径处理
+            } else {
+              errorMessage.value = "请拖放有效的音频文件";
+              currentState.value = "error";
+              console.warn("拖放的文件类型不被支持:", filePath);
+            }
           }
-        }
-      }
-    });
-
-    // 监听拖放操作被取消的事件 (例如文件拖出窗口)
-    unlistenCancel = await listen<null>("tauri://drag-leave", () => {
-      isDragging.value = false; // 移除视觉反馈
+          break;
+        case "leave": // Corresponds to the old "tauri://drag-leave" or when dragging out
+          isDragging.value = false;
+          console.log('File drag left window area or cancelled');
+          break;
+        // The 'enter' event type is also available but not explicitly handled here for a visual change
+        // as 'over' will quickly follow if files are dragged over the window.
+        default:
+          // This case might catch 'enter' or any other unexpected event types.
+          // Setting isDragging to false is a safe default.
+          isDragging.value = false;
+          console.log('Unhandled drag event type or drag operation ended/entered:', event.payload.type);
+          break;
+       }
     });
   } catch (error) {
-    console.error("设置 Tauri 文件拖放监听器失败 (v2):", error);
+    console.error("设置 Tauri 文件拖放监听器失败 (onDragDropEvent):", error);
     // 这里可以考虑通知用户拖放功能可能无法使用
   }
 });
 
 // 在组件卸载时清理监听器，防止内存泄漏
 onUnmounted(() => {
-  unlistenDrop?.();
-  unlistenHover?.();
-  unlistenCancel?.();
+  unlistenDragDrop?.();
 });
 </script>
 
